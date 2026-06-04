@@ -323,7 +323,7 @@ async def id_menu_message(message: Message, state: FSMContext) -> None:
     await state.update_data(last_menu_type='id')
 
 
-@router.message(F.text == "🕵️ OSINT")
+@router.message(F.text == "🕵️ Simple OSINT tool")
 async def osint_menu_message(message: Message, state: FSMContext) -> None:
     await message.answer("🕵️ OSINT Tools:", reply_markup=osint_keyboard())
     await state.set_state(MenuStates.osint_menu)
