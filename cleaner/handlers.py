@@ -7,10 +7,11 @@ from typing import Dict
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, KeyboardButton, ReplyKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, FSInputFile, KeyboardButton, ReplyKeyboardMarkup, Message
 
 from .metrics import messages_processed, commands_processed, errors_total, processing_time, files_processed
 from .cleaner import clean_cookies, get_sites_by_category
+from .osint import TOOL_PROMPTS, TOOL_TITLES, run_tool
 
 logger = logging.getLogger(__name__)
 
@@ -23,20 +24,59 @@ class MenuStates(StatesGroup):
     main_menu = State()
     id_menu = State()
     get_id_waiting = State()
+    osint_menu = State()
+    osint_waiting = State()
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🍪 Cookie Cleaner")],
+            [KeyboardButton(text="🆔 ID"), KeyboardButton(text="🕵️ Simple OSINT tool")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def osint_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Username"), KeyboardButton(text="🌐 IP Tracker")],
+            [KeyboardButton(text="📞 Phone"), KeyboardButton(text="🚗 Vehicle")],
+            [KeyboardButton(text="🌍 WHOIS / Domain"), KeyboardButton(text="📧 SMTP")],
+            [KeyboardButton(text="🔗 Connections")],
+            [KeyboardButton(text="🔙 Back")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def osint_result_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔄 OSINT Again")],
+            [KeyboardButton(text="🔙 Back"), KeyboardButton(text="🏠 Main Menu")],
+        ],
+        resize_keyboard=True
+    )
+
+
+OSINT_BUTTONS = {
+    "👤 Username": "username",
+    "🌐 IP Tracker": "ip",
+    "📞 Phone": "phone",
+    "🚗 Vehicle": "vehicle",
+    "🌍 WHOIS / Domain": "domain",
+    "📧 SMTP": "smtp",
+    "🔗 Connections": "connections",
+}
 
 
 @router.message(F.text == "/start")
 async def start(message: Message, state: FSMContext) -> None:
     messages_processed.inc()
     commands_processed.labels(command="/start").inc()
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍪 Cookie Cleaner")],
-            [KeyboardButton(text="🆔 ID")]
-        ],
-        resize_keyboard=True
-    )
-    main_msg = await message.answer("Welcome! Choose an action:", reply_markup=keyboard)
+    main_msg = await message.answer("Welcome! Choose an action:", reply_markup=main_keyboard())
     await state.update_data(main_message_id=main_msg.message_id)
     await state.set_state(MenuStates.main_menu)
 
@@ -282,6 +322,94 @@ async def id_menu_message(message: Message, state: FSMContext) -> None:
     await state.set_state(MenuStates.id_menu)
     await state.update_data(last_menu_type='id')
 
+
+@router.message(F.text == "🕵️ OSINT")
+async def osint_menu_message(message: Message, state: FSMContext) -> None:
+    await message.answer("🕵️ OSINT Tools:", reply_markup=osint_keyboard())
+    await state.set_state(MenuStates.osint_menu)
+    await state.update_data(last_menu_type='osint')
+
+
+@router.message(F.text.in_(set(OSINT_BUTTONS.keys())))
+async def osint_tool_message(message: Message, state: FSMContext) -> None:
+    tool = OSINT_BUTTONS[message.text]
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔙 Back"), KeyboardButton(text="🏠 Main Menu")]
+        ],
+        resize_keyboard=True
+    )
+    await state.update_data(selected_osint_tool=tool, last_menu_type='osint')
+    await message.answer(TOOL_PROMPTS[tool], reply_markup=keyboard)
+    await state.set_state(MenuStates.osint_waiting)
+
+
+@router.message(F.text == "🔄 OSINT Again")
+async def osint_again_message(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    tool = data.get("selected_osint_tool")
+    if tool:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🔙 Back"), KeyboardButton(text="🏠 Main Menu")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer(TOOL_PROMPTS[tool], reply_markup=keyboard)
+        await state.set_state(MenuStates.osint_waiting)
+        return
+    await message.answer("🕵️ OSINT Tools:", reply_markup=osint_keyboard())
+    await state.set_state(MenuStates.osint_menu)
+    await state.update_data(last_menu_type='osint')
+
+
+@router.message(MenuStates.osint_waiting, F.text, ~F.text.in_({"🔙 Back", "🏠 Main Menu"}))
+async def osint_query_message(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    tool = data.get("selected_osint_tool")
+    if not tool:
+        await message.answer("❌ OSINT session expired. Choose a tool again.", reply_markup=osint_keyboard())
+        await state.set_state(MenuStates.osint_menu)
+        return
+
+    status_msg = await message.answer(f"⏳ Running {TOOL_TITLES.get(tool, 'OSINT')}...")
+    result = await run_tool(tool, message.text)
+    title = TOOL_TITLES.get(tool, "OSINT")
+
+    if tool == "username" and len(result) > 3900:
+        await status_msg.edit_text("✅ Username scan complete. Sending result in parts...")
+        for part in split_message(result):
+            await message.answer(part)
+    elif len(result) <= 3900:
+        await status_msg.edit_text(result)
+    else:
+        filename = f"osint_{tool}_result.txt"
+        await status_msg.edit_text("✅ Result is too long, sending as a file...")
+        await message.answer_document(
+            BufferedInputFile(result.encode("utf-8"), filename=filename),
+            caption=f"{title} result",
+        )
+
+    await message.answer("Choose an action:", reply_markup=osint_result_keyboard())
+    await state.set_state(MenuStates.osint_menu)
+    await state.update_data(last_menu_type='osint')
+
+
+def split_message(text: str, limit: int = 3900) -> list[str]:
+    parts = []
+    current = ""
+    for line in text.splitlines():
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+        current = line
+    if current:
+        parts.append(current)
+    return parts
+
 @router.message(F.text == "👤 Get my ID", MenuStates.id_menu)
 async def get_my_id_message(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
@@ -317,14 +445,7 @@ async def get_another_id_message(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "🏠 Main Menu")
 async def back_to_main_message(message: Message, state: FSMContext) -> None:
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍪 Cookie Cleaner")],
-            [KeyboardButton(text="🆔 ID")]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Welcome! Choose an action:", reply_markup=keyboard)
+    await message.answer("Welcome! Choose an action:", reply_markup=main_keyboard())
     await state.set_state(MenuStates.main_menu)
 
 @router.message(F.text == "🔙 Back")
@@ -333,15 +454,16 @@ async def back_button_handler(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     last_menu_type = data.get('last_menu_type', 'main')
 
-    if current_state and str(current_state).endswith('id_menu') or last_menu_type == 'id':
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🍪 Cookie Cleaner")],
-                [KeyboardButton(text="🆔 ID")]
-            ],
-            resize_keyboard=True
-        )
-        await message.answer("Welcome! Choose an action:", reply_markup=keyboard)
+    if last_menu_type == 'osint':
+        if current_state and str(current_state).endswith('osint_waiting'):
+            await message.answer("🕵️ OSINT Tools:", reply_markup=osint_keyboard())
+            await state.set_state(MenuStates.osint_menu)
+            return
+        await message.answer("Welcome! Choose an action:", reply_markup=main_keyboard())
+        await state.set_state(MenuStates.main_menu)
+        await state.update_data(last_menu_type='main')
+    elif (current_state and str(current_state).endswith('id_menu')) or last_menu_type == 'id':
+        await message.answer("Welcome! Choose an action:", reply_markup=main_keyboard())
         await state.set_state(MenuStates.main_menu)
         await state.update_data(last_menu_type='main')
     else:
@@ -421,13 +543,6 @@ async def upload_another_message(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "❌ Cancel")
 async def cancel_message(message: Message, state: FSMContext) -> None:
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍪 Cookie Cleaner")],
-            [KeyboardButton(text="🆔 ID")]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Action cancelled.", reply_markup=keyboard)
+    await message.answer("Action cancelled.", reply_markup=main_keyboard())
     await state.clear()
     await state.set_state(MenuStates.main_menu)
