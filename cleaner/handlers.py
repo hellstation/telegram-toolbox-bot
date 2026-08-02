@@ -11,7 +11,12 @@ from aiogram.types import BufferedInputFile, FSInputFile, KeyboardButton, ReplyK
 
 from .metrics import messages_processed, commands_processed, errors_total, processing_time, files_processed
 from .cleaner import clean_cookies, get_sites_by_category
-from .osint import TOOL_PROMPTS, TOOL_TITLES, run_tool
+from .osint import TOOL_PROMPTS, TOOL_TITLES, run_tool, is_ip_address
+from .security.service import (
+    DomainReport,
+    analyze_domain_report,
+    check_domain_rate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +375,57 @@ async def osint_query_message(message: Message, state: FSMContext) -> None:
     if not tool:
         await message.answer("❌ OSINT session expired. Choose a tool again.", reply_markup=osint_keyboard())
         await state.set_state(MenuStates.osint_menu)
+        return
+
+    # Full domain security analysis → HTML report (kkkk-style)
+    if tool == "domain" and not is_ip_address(message.text.strip()):
+        user_id = message.from_user.id if message.from_user else 0
+        remaining = check_domain_rate_limit(user_id)
+        if remaining is not None:
+            await message.answer(
+                f"⏳ Too many domain scans. Wait {remaining}s before the next analysis."
+            )
+            return
+
+        status_msg = await message.answer(
+            f"⏳ Analyzing domain security for {message.text.strip()}…\n"
+            f"This may take 10–60 seconds (WHOIS, DNS, tech, CVE, SSL…)."
+        )
+        try:
+            report = await analyze_domain_report(message.text)
+        except Exception as e:
+            errors_total.labels(type="domain_security").inc()
+            logger.exception("Domain security analysis failed")
+            try:
+                await status_msg.edit_text(f"❌ Domain analysis failed: {str(e)[:300]}")
+            except Exception:
+                await message.answer(f"❌ Domain analysis failed: {str(e)[:300]}")
+            await message.answer("Choose an action:", reply_markup=osint_result_keyboard())
+            await state.set_state(MenuStates.osint_menu)
+            await state.update_data(last_menu_type="osint")
+            return
+
+        if isinstance(report, str):
+            try:
+                await status_msg.edit_text(report)
+            except Exception:
+                await message.answer(report)
+            await message.answer("Choose an action:", reply_markup=osint_result_keyboard())
+            await state.set_state(MenuStates.osint_menu)
+            await state.update_data(last_menu_type="osint")
+            return
+
+        assert isinstance(report, DomainReport)
+        safe_filename = f"report_{report.domain.replace('.', '_')}.html"
+        document = BufferedInputFile(report.html.encode("utf-8"), filename=safe_filename)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.answer_document(document=document, caption=report.caption)
+        await message.answer("Choose an action:", reply_markup=osint_result_keyboard())
+        await state.set_state(MenuStates.osint_menu)
+        await state.update_data(last_menu_type="osint")
         return
 
     status_msg = await message.answer(f"⏳ Running {TOOL_TITLES.get(tool, 'OSINT')}...")

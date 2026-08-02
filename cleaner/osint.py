@@ -58,7 +58,7 @@ TOOL_PROMPTS = {
     "vehicle": "🚗 Send Dutch license plate, e.g. AB-12-CD:",
     "smtp": "📧 Send email address:",
     "connections": "🔗 Send email address:",
-    "domain": "🌍 Send domain or IP:",
+    "domain": "🌍 Send domain for full security HTML report, or an IP for tracker:",
 }
 
 
@@ -413,6 +413,7 @@ async def inspect_connections(email: str) -> str:
 
 
 async def inspect_domain(domain: str) -> str:
+    """IP path only. Full domain security report is handled in handlers via HTML."""
     domain = domain.strip().lower()
     if is_ip_address(domain):
         ip_info_task = asyncio.create_task(track_ip(domain))
@@ -426,55 +427,10 @@ async def inspect_domain(domain: str) -> str:
         lines.append(ip_info)
         return "\n".join(lines)
 
-    whois_task = asyncio.create_task(lookup_whois(domain))
-    dns_task = asyncio.create_task(resolve_dns_records(domain))
-    crtsh_task = asyncio.create_task(fetch_crtsh_entries(domain))
-    http_task = asyncio.create_task(fetch_http_intel(domain))
-    whois_result, dns_records, crtsh_entries, http_intel = await asyncio.gather(
-        whois_task,
-        dns_task,
-        crtsh_task,
-        http_task,
+    return (
+        "❌ Domain analysis now returns an HTML security report. "
+        "If you see this message, the bot handler failed to route the request."
     )
-    emails = extract_certificate_emails(domain, crtsh_entries)
-    subdomains = extract_certificate_subdomains(domain, crtsh_entries)
-
-    lines = [f"🌍 WHOIS / Domain: {domain}", ""]
-    if whois_result.startswith("❌"):
-        lines.append(f"WHOIS: {whois_result}")
-    else:
-        lines.append(whois_result)
-    lines.append("")
-
-    lines.append("DNS records:")
-    for record_type in ("A", "AAAA", "MX", "NS", "TXT", "CAA"):
-        values = dns_records.get(record_type, [])
-        lines.append(f"{record_type}:")
-        if values:
-            lines.extend(f"• {value}" for value in values[:12])
-            if len(values) > 12:
-                lines.append(f"• ... and {len(values) - 12} more")
-        else:
-            lines.append("• Not found")
-
-    lines.append("")
-    lines.append("Subdomains from crt.sh:")
-    if subdomains:
-        lines.extend(f"• {subdomain}" for subdomain in subdomains[:50])
-        if len(subdomains) > 50:
-            lines.append(f"• ... and {len(subdomains) - 50} more")
-    else:
-        lines.append("No subdomains found in crt.sh.")
-
-    lines.append("")
-    lines.append("Certificate emails:")
-    lines.extend(f"• {email}" for email in emails[:25]) if emails else lines.append("No emails found in crt.sh.")
-    if len(emails) > 25:
-        lines.append(f"• ... and {len(emails) - 25} more")
-
-    lines.append("")
-    lines.append(format_http_intel(http_intel))
-    return "\n".join(lines)
 
 
 def is_ip_address(value: str) -> bool:
