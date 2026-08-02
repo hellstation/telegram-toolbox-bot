@@ -49,6 +49,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Drop local bytecode before upload
+        run: find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+
       - name: Upload project to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -61,6 +64,9 @@ jobs:
           strip_components: 0
           overwrite: true
           rm: false
+          # Connection + transfer can be slow to some VPS; defaults (30s / 10m) are too tight
+          timeout: 120s
+          command_timeout: 30m
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.2.0
@@ -82,6 +88,9 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || '22' }}
           envs: BOT_TOKEN,METRICS_PORT,GF_SECURITY_ADMIN_PASSWORD,NVD_API_KEY,SHODAN_API_KEY,CENSYS_API_ID,CENSYS_API_SECRET,REQUEST_TIMEOUT,MAX_CVE_RESULTS,DOMAIN_RATE_LIMIT_SECONDS
+          # docker compose --build (maigret deps) often needs 15–30+ minutes on small VPS
+          timeout: 120s
+          command_timeout: 40m
           script_stop: true
           script: |
             set -e
