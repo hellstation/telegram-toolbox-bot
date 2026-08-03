@@ -59,7 +59,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || '22' }}
-          source: "Dockerfile,docker-compose.yml,requirements.txt,main.py,cleaner,monitoring,.env.example"
+          source: "Dockerfile,docker-compose.yml,requirements.txt,main.py,cleaner,.env.example"
           target: "~/apps/telegram-toolbox-bot"
           strip_components: 0
           overwrite: true
@@ -72,8 +72,6 @@ jobs:
         uses: appleboy/ssh-action@v1.2.0
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          METRICS_PORT: ${{ secrets.METRICS_PORT || '8000' }}
-          GF_SECURITY_ADMIN_PASSWORD: ${{ secrets.GF_SECURITY_ADMIN_PASSWORD }}
           # Domain Security Analyzer — optional; empty secrets are fine
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
@@ -87,7 +85,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || '22' }}
-          envs: BOT_TOKEN,METRICS_PORT,GF_SECURITY_ADMIN_PASSWORD,NVD_API_KEY,SHODAN_API_KEY,CENSYS_API_ID,CENSYS_API_SECRET,REQUEST_TIMEOUT,MAX_CVE_RESULTS,DOMAIN_RATE_LIMIT_SECONDS
+          envs: BOT_TOKEN,NVD_API_KEY,SHODAN_API_KEY,CENSYS_API_ID,CENSYS_API_SECRET,REQUEST_TIMEOUT,MAX_CVE_RESULTS,DOMAIN_RATE_LIMIT_SECONDS
           # docker compose --build (maigret deps) often needs 15–30+ minutes on small VPS
           timeout: 120s
           command_timeout: 40m
@@ -101,8 +99,6 @@ jobs:
 
             {
               echo "BOT_TOKEN=${BOT_TOKEN}"
-              echo "METRICS_PORT=${METRICS_PORT}"
-              echo "GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}"
               echo "NVD_API_KEY=${NVD_API_KEY}"
               echo "SHODAN_API_KEY=${SHODAN_API_KEY}"
               echo "CENSYS_API_ID=${CENSYS_API_ID}"
@@ -111,6 +107,9 @@ jobs:
               echo "MAX_CVE_RESULTS=${MAX_CVE_RESULTS}"
               echo "DOMAIN_RATE_LIMIT_SECONDS=${DOMAIN_RATE_LIMIT_SECONDS}"
             } > .env
+
+            # Drop leftover monitoring stack from older deploys
+            rm -rf monitoring
 
             if docker compose version >/dev/null 2>&1; then
               docker compose up -d --build --remove-orphans

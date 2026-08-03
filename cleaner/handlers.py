@@ -1,7 +1,6 @@
 import logging
 import os
 import tempfile
-import time
 from typing import Dict
 
 from aiogram import Router, F
@@ -9,8 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, FSInputFile, KeyboardButton, ReplyKeyboardMarkup, Message
 
-from .metrics import messages_processed, commands_processed, errors_total, processing_time, files_processed
-from .cleaner import clean_cookies, get_sites_by_category
+from .cleaner import calculate_score, clean_cookies, get_sites_by_category
 from .osint import TOOL_PROMPTS, TOOL_TITLES, run_tool, is_ip_address
 from .security.service import (
     DomainReport,
@@ -79,8 +77,6 @@ OSINT_BUTTONS = {
 
 @router.message(F.text == "/start")
 async def start(message: Message, state: FSMContext) -> None:
-    messages_processed.inc()
-    commands_processed.labels(command="/start").inc()
     main_msg = await message.answer("Welcome! Choose an action:", reply_markup=main_keyboard())
     await state.update_data(main_message_id=main_msg.message_id)
     await state.set_state(MenuStates.main_menu)
@@ -98,9 +94,58 @@ async def cookie_cleaner_message(message: Message, state: FSMContext) -> None:
     await state.set_state(CookieStates.waiting_for_file)
 
 
-@router.message(F.document)
+def _build_cookie_stats_report(stats: Dict) -> tuple[str, int, str]:
+    """Build stats report text. Returns (report_text, score, level)."""
+    site_counter = {site: count for site, count in stats["sites"].items()}
+    service_counter = {
+        site: {svc: 1 for svc in svcs} for site, svcs in stats["services"].items()
+    }
+    auth_detected = {
+        site: set(cookies) for site, cookies in stats["auth_detected"].items()
+    }
+    score, level, _ = calculate_score(site_counter, service_counter, auth_detected)
+    categories = get_sites_by_category(site_counter)
+
+    lines = [f"🧠 SCORE: {score} ({level})", ""]
+
+    for site, count in stats["sites"].items():
+        services = ", ".join([s for s in stats["services"].get(site, []) if s])
+        if services:
+            lines.append(f"{site}({count}) - {services}")
+        else:
+            lines.append(f"{site}({count})")
+
+    if stats["auth_detected"]:
+        lines.append("")
+        lines.append("🔐 AUTH DETECTED:")
+        for site, cookies in stats["auth_detected"].items():
+            lines.append(f"{site}: {', '.join(cookies)}")
+
+    lines.extend(
+        [
+            "",
+            "=== STATISTICS ===",
+            f"Total unique cookies: {stats['total_unique_cookies']}",
+            f"Unique main domains: {stats['unique_sites']}",
+            f"Most common domain: {stats['most_common_site']}",
+            f"Oldest cookies age: {stats.get('oldest_cookie_age', 'Unknown')}",
+            f"Tracking cookies detected: {stats.get('tracking_intensity', 0)}",
+            f"🏆 Privacy Score: {stats.get('privacy_score', 0.0)}/10.0",
+        ]
+    )
+
+    if categories:
+        lines.append("")
+        lines.append("=== BY CATEGORIES ===")
+        for category, sites in categories.items():
+            if sites:
+                lines.append(f"{category.capitalize()}: {', '.join(sites)}")
+
+    return "\n".join(lines) + "\n", score, level
+
+
+@router.message(CookieStates.waiting_for_file, F.document)
 async def file_handler(message: Message, state: FSMContext) -> None:
-    messages_processed.inc()
     document = message.document
     if not document:
         await message.answer("Please upload a file.")
@@ -111,7 +156,7 @@ async def file_handler(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
-    status_message_id = data.get('message_id')
+    status_message_id = data.get("message_id")
 
     if not status_message_id:
         await message.answer("Session error. Please start over.")
@@ -122,13 +167,12 @@ async def file_handler(message: Message, state: FSMContext) -> None:
     temp_output = None
     stats_file = None
 
-    start_time = time.time()
     try:
         try:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
-                text="⏳ Processing your cookie file..."
+                text="⏳ Processing your cookie file...",
             )
         except Exception:
             status_msg = await message.answer("⏳ Processing your cookie file...")
@@ -143,13 +187,14 @@ async def file_handler(message: Message, state: FSMContext) -> None:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
-                text="🧹 Cleaning cookies..."
+                text="🧹 Cleaning cookies...",
             )
         except Exception:
             status_msg = await message.answer("🧹 Cleaning cookies...")
             await state.update_data(message_id=status_msg.message_id)
             status_message_id = status_msg.message_id
 
+        # clean_cookies writes real cleaned cookie lines to temp_output — do not overwrite
         temp_output = temp_input + "_cleaned.txt"
         stats: Dict = clean_cookies(temp_input, temp_output)
 
@@ -157,160 +202,93 @@ async def file_handler(message: Message, state: FSMContext) -> None:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
-                text="📊 Generating statistics..."
+                text="📊 Generating statistics...",
             )
         except Exception:
             status_msg = await message.answer("📊 Generating statistics...")
             await state.update_data(message_id=status_msg.message_id)
             status_message_id = status_msg.message_id
 
+        report_content, score, level = _build_cookie_stats_report(stats)
         stats_file = temp_input + "_stats.txt"
         with open(stats_file, "w", encoding="utf-8") as f:
-            from .cleaner import calculate_score
-            site_counter = {site: count for site, count in stats["sites"].items()}
-            service_counter = {site: {svc: 1 for svc in svcs} for site, svcs in stats["services"].items()}
-            auth_detected = {site: set(cookies) for site, cookies in stats["auth_detected"].items()}
-            score, level, _ = calculate_score(site_counter, service_counter, auth_detected)
-            categories = get_sites_by_category(site_counter)
-            f.write(f"🧠 SCORE: {score} ({level})\n\n")
-
-            for site, count in stats["sites"].items():
-                site_name = site
-                services = ", ".join([s for s in stats["services"].get(site, []) if s])
-                if services:
-                    f.write(f"{site_name}({count}) - {services}\n")
-                else:
-                    f.write(f"{site_name}({count})\n")
-
-            if stats["auth_detected"]:
-                f.write("\n🔐 AUTH DETECTED:\n")
-                for site, cookies in stats["auth_detected"].items():
-                    site_name = site
-                    f.write(f"{site_name}: {', '.join(cookies)}\n")
-
-            f.write(f"\n=== STATISTICS ===\n")
-            f.write(f"Total unique cookies: {stats['total_unique_cookies']}\n")
-            f.write(f"Unique main domains: {stats['unique_sites']}\n")
-            f.write(f"Most common domain: {stats['most_common_site']}\n")
-            f.write(f"Oldest cookies age: {stats.get('oldest_cookie_age', 'Unknown')}\n")
-            f.write(f"Tracking cookies detected: {stats.get('tracking_intensity', 0)}\n")
-            f.write(f"🏆 Privacy Score: {stats.get('privacy_score', 0.0)}/10.0\n")
-
-            if categories:
-                f.write("\n=== BY CATEGORIES ===\n")
-                for category, sites in categories.items():
-                    if sites:
-                        f.write(f"{category.capitalize()}: {', '.join(sites)}\n")
+            f.write(report_content)
 
         try:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
-                text="✅ Processing complete! Sending results..."
+                text="✅ Processing complete! Sending results...",
             )
         except Exception:
             await message.answer("✅ Processing complete! Sending results...")
 
-        # Get original filename without extension
-        original_name = os.path.splitext(document.file_name)[0]
+        original_name = os.path.splitext(document.file_name or "cookies")[0]
         cleaned_filename = f"cleaned_{original_name}.txt"
+        stats_filename = f"stats_{original_name}.txt"
 
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="🔄 Upload Another"), KeyboardButton(text="❌ Cancel")]
             ],
-            resize_keyboard=True
+            resize_keyboard=True,
         )
 
-        # Create the full formatted report content
-        report_content = f"""🧠 SCORE: {score} ({level})
-
-"""
-
-        # Add site information
-        for site, count in stats["sites"].items():
-            site_name = site
-            services = ", ".join([s for s in stats["services"].get(site, []) if s])
-            if services:
-                report_content += f"{site_name}({count}) - {services}\n"
-            else:
-                report_content += f"{site_name}({count})\n"
-
-        # Add auth detected section
-        if stats["auth_detected"]:
-            report_content += "\n🔐 AUTH DETECTED:\n"
-            for site, cookies in stats["auth_detected"].items():
-                site_name = site
-                report_content += f"{site_name}: {', '.join(cookies)}\n"
-
-        # Add statistics section
-        report_content += f"""
-=== STATISTICS ===
-Total unique cookies: {stats['total_unique_cookies']}
-Unique main domains: {stats['unique_sites']}
-Most common domain: {stats['most_common_site']}
-Oldest cookies age: {stats.get('oldest_cookie_age', 'Unknown')}
-Tracking cookies detected: {stats.get('tracking_intensity', 0)}
-🏆 Privacy Score: {stats.get('privacy_score', 0.0)}/10.0
-"""
-
-        # Add categories section
-        if categories:
-            report_content += "\n=== BY CATEGORIES ===\n"
-            for category, sites in categories.items():
-                if sites:
-                    report_content += f"{category.capitalize()}: {', '.join(sites)}\n"
-
-        # Write the report to the cleaned file
-        with open(temp_output, "w", encoding="utf-8") as f:
-            f.write(report_content)
-
-        # Send the report file
+        # 1) Actual cleaned cookies (Netscape/Edge lines)
         await message.answer_document(
             FSInputFile(temp_output, filename=cleaned_filename),
-            caption=f"Cleaned cookies report. Total kept: {stats['total_cleaned']}\n\nChoose an action:",
-            reply_markup=keyboard
+            caption=f"🍪 Cleaned cookies. Total kept: {stats['total_cleaned']}",
+        )
+        # 2) Separate stats/report file — never overwrite cleaned cookies
+        await message.answer_document(
+            FSInputFile(stats_file, filename=stats_filename),
+            caption=(
+                f"📊 Report. Score: {score} ({level})\n"
+                f"Privacy: {stats.get('privacy_score', 0.0)}/10.0\n\n"
+                f"Choose an action:"
+            ),
+            reply_markup=keyboard,
         )
 
-        # Final status update without sending another message since keyboard is already sent with stats
         try:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
-                text="✅ Processing complete!"
+                text="✅ Processing complete!",
             )
         except Exception:
-            pass  # Status message already updated
+            pass
 
-        processing_time.observe(time.time() - start_time)
-        files_processed.inc()
-        logger.info(f"Processed cookies for user {message.from_user.id}")
+        logger.info(
+            "Processed cookies for user %s",
+            message.from_user.id if message.from_user else "?",
+        )
 
     except Exception as e:
-        errors_total.labels(type="file_processing").inc()
-        logger.error(f"Error processing file: {e}")
+        logger.error("Error processing file: %s", e)
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="🔄 Upload Another"), KeyboardButton(text="❌ Cancel")]
             ],
-            resize_keyboard=True
+            resize_keyboard=True,
         )
         try:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_message_id,
                 text=f"❌ Error: {str(e)}\n\nUpload another file or cancel:",
-                reply_markup=keyboard
+                reply_markup=keyboard,
             )
         except Exception:
-            await message.answer(f"Error processing file: {str(e)}\n\nChoose an action:", reply_markup=keyboard)
+            await message.answer(
+                f"Error processing file: {str(e)}\n\nChoose an action:",
+                reply_markup=keyboard,
+            )
             await state.clear()
     finally:
         for file_path in [temp_input, temp_output, stats_file]:
             if file_path and os.path.exists(file_path):
                 os.unlink(file_path)
-
-
 
 
 
@@ -394,7 +372,6 @@ async def osint_query_message(message: Message, state: FSMContext) -> None:
         try:
             report = await analyze_domain_report(message.text)
         except Exception as e:
-            errors_total.labels(type="domain_security").inc()
             logger.exception("Domain security analysis failed")
             try:
                 await status_msg.edit_text(f"❌ Domain analysis failed: {str(e)[:300]}")
